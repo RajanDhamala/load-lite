@@ -12,7 +12,6 @@ import (
 	"time"
 )
 
-// Config holds all CLI configuration
 type Config struct {
 	URL      string
 	Method   string
@@ -22,7 +21,6 @@ type Config struct {
 	Headers  string
 }
 
-// Stats tracks request metrics
 type Stats struct {
 	mu        sync.Mutex
 	latencies []time.Duration
@@ -82,7 +80,6 @@ func (s *Stats) calculate() Summary {
 	}
 }
 
-// Summary holds final calculated statistics
 type Summary struct {
 	Requests int
 	Errors   int
@@ -244,7 +241,6 @@ func main() {
 
 	generator := NewTrafficGenerator(cfg)
 	summary := generator.Run()
-
 	fmt.Println()
 	fmt.Println("========================================")
 	fmt.Println("         Traffic Test Summary")
