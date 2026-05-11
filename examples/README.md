@@ -17,7 +17,7 @@ This directory contains example scripts demonstrating various usage patterns for
 ### Basic Syntax
 
 ```bash
-./load-lite --url <URL> --method <METHOD> --rps <RATE> --duration <SECONDS>
+./load-lite --url <URL> --method <METHOD> --rps <RATE> --duration <SECONDS> --timeout <SECONDS>
 ```
 
 ### All Available Flags
@@ -28,6 +28,8 @@ This directory contains example scripts demonstrating various usage patterns for
   --method POST \                       # HTTP method: GET or POST (default: GET)
   --rps 100 \                           # Requests per second (default: 400)
   --duration 60 \                       # Duration in seconds (default: 10)
+  --timeout 5 \                         # Request timeout in seconds (default: 5)
+  --concurrency 100 \                   # Max in-flight requests (default: rps)
   --body '{"key":"value"}' \            # Request body for POST
   --headers 'Key:Value,Key2:Value2'     # Custom headers (comma-separated)
 ```
@@ -84,4 +86,5 @@ This directory contains example scripts demonstrating various usage patterns for
 - **Start Low**: Begin with low RPS (5-10) and increase gradually
 - **Monitor Target**: Watch your target system's metrics while testing
 - **Use Appropriate Duration**: Short tests (10-30s) for quick checks, longer (60-300s) for stability
+- **Tune Concurrency**: Increase `--concurrency` if normal target latency causes dropped ticks
 - **Headers Format**: Use `Key:Value` format, separate multiple with commas (no spaces around commas)

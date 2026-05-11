@@ -60,6 +60,8 @@ go run main.go --url http://localhost:8080 --rps 10 --duration 10
 | `--method` | string | `GET` | HTTP method (`GET` or `POST`) |
 | `--rps` | int | `400` | Requests per second |
 | `--duration` | int | `10` | Test duration in seconds |
+| `--timeout` | int | `5` | Per-request timeout in seconds |
+| `--concurrency` | int | `rps` | Maximum concurrent in-flight requests |
 | `--body` | string | `""` | Request body (for POST requests) |
 | `--headers` | string | `""` | Custom headers (comma-separated) |
 
@@ -110,6 +112,24 @@ How long to run the test in seconds.
 ./load-lite --url http://localhost:8080 --duration 300
 ```
 
+#### `--timeout`
+Per-request timeout in seconds. The default is intentionally short so slow or broken targets do not keep the CLI alive for a long time after the traffic window ends.
+
+```bash
+# Fail slow requests after 2 seconds
+./load-lite --url http://localhost:8080 --timeout 2
+```
+
+#### `--concurrency`
+Maximum number of in-flight HTTP requests. Defaults to `--rps`.
+
+If every worker is busy, the scheduled tick is counted as `Dropped` instead of starting unbounded goroutines. Increase this when your target has higher normal latency and you still want to sustain the configured RPS.
+
+```bash
+# Allow up to 500 active requests while generating 200 RPS
+./load-lite --url http://localhost:8080 --rps 200 --concurrency 500
+```
+
 #### `--body`
 Request body for POST requests. Use with `--method POST`.
 
@@ -145,15 +165,17 @@ Custom HTTP headers. Multiple headers are comma-separated, key:value format.
 ## Output
 
 ```
-Starting traffic generation: 100 rps for 30 seconds to http://localhost:8080/api
+Starting traffic generation: 100 rps for 30 seconds to http://localhost:8080/api (timeout=5s, concurrency=100)
 
 ========================================
          Traffic Test Summary
 ========================================
   Requests       : 3000
+  Successes      : 2995
   Errors         : 5
+  Dropped        : 0
 
-  Latency
+  Successful Response Latency
   ------------------------------
   Avg            : 42ms
   Min            : 8ms
@@ -204,8 +226,8 @@ See the [`examples/`](./examples) directory for complete usage examples:
 | Metric | Value | Notes |
 |--------|-------|-------|
 | CPU | <5% | At 100 RPS on modern hardware |
-| Memory | ~100KB base + (RPS × duration × 16 bytes) | For latency storage |
-| Connections | Pooled & reused | HTTP keep-alive enabled |
+| Memory | Bounded | Latency statistics use a fixed millisecond histogram based on `--timeout`, not one entry per request |
+| Connections | Bounded, pooled & reused | `--concurrency` caps active requests and connection usage |
 
 ## Contributing
 

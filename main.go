@@ -6,33 +6,54 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
 	"strings"
 	"sync"
 	"time"
 )
 
 type Config struct {
-	URL      string
-	Method   string
-	RPS      int
-	Duration int
-	Body     string
-	Headers  string
+	URL         string
+	Method      string
+	RPS         int
+	Duration    int
+	Timeout     int
+	Concurrency int
+	Body        string
+	Headers     string
 }
 
 type Stats struct {
-	mu        sync.Mutex
-	latencies []time.Duration
-	errors    int
-	requests  int
+	mu           sync.Mutex
+	latencyHist  []int
+	requests     int
+	successes    int
+	errors       int
+	dropped      int
+	totalLatency time.Duration
+	minLatency   time.Duration
+	maxLatency   time.Duration
 }
 
 func (s *Stats) recordSuccess(latency time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.latencies = append(s.latencies, latency)
+
 	s.requests++
+	s.successes++
+	s.totalLatency += latency
+
+	if s.successes == 1 || latency < s.minLatency {
+		s.minLatency = latency
+	}
+	if latency > s.maxLatency {
+		s.maxLatency = latency
+	}
+
+	bucket := int(latency / time.Millisecond)
+	if bucket >= len(s.latencyHist) {
+		bucket = len(s.latencyHist) - 1
+	}
+	s.latencyHist[bucket]++
 }
 
 func (s *Stats) recordError() {
@@ -42,64 +63,71 @@ func (s *Stats) recordError() {
 	s.requests++
 }
 
+func (s *Stats) recordDropped() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.dropped++
+}
+
 func (s *Stats) calculate() Summary {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if len(s.latencies) == 0 {
-		return Summary{Requests: s.requests, Errors: s.errors}
+	if s.successes == 0 {
+		return Summary{Requests: s.requests, Errors: s.errors, Dropped: s.dropped}
 	}
-
-	// Sort for percentile calculation
-	sorted := make([]time.Duration, len(s.latencies))
-	copy(sorted, s.latencies)
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i] < sorted[j]
-	})
-
-	var total time.Duration
-	min := sorted[0]
-	max := sorted[len(sorted)-1]
-
-	for _, d := range sorted {
-		total += d
-	}
-
-	avg := total / time.Duration(len(sorted))
-	p95 := percentile(sorted, 0.95)
-	p99 := percentile(sorted, 0.99)
 
 	return Summary{
-		Requests: s.requests,
-		Errors:   s.errors,
-		Avg:      avg,
-		Min:      min,
-		Max:      max,
-		P95:      p95,
-		P99:      p99,
+		Requests:  s.requests,
+		Successes: s.successes,
+		Errors:    s.errors,
+		Dropped:   s.dropped,
+		Avg:       s.totalLatency / time.Duration(s.successes),
+		Min:       s.minLatency,
+		Max:       s.maxLatency,
+		P95:       percentile(s.latencyHist, s.successes, 95),
+		P99:       percentile(s.latencyHist, s.successes, 99),
 	}
 }
 
 type Summary struct {
-	Requests int
-	Errors   int
-	Avg      time.Duration
-	Min      time.Duration
-	Max      time.Duration
-	P95      time.Duration
-	P99      time.Duration
+	Requests  int
+	Successes int
+	Errors    int
+	Dropped   int
+	Avg       time.Duration
+	Min       time.Duration
+	Max       time.Duration
+	P95       time.Duration
+	P99       time.Duration
 }
 
-func percentile(sorted []time.Duration, p float64) time.Duration {
-	if len(sorted) == 0 {
+func NewStats(timeout time.Duration) *Stats {
+	buckets := int(timeout/time.Millisecond) + 2
+	if buckets < 2 {
+		buckets = 2
+	}
+
+	return &Stats{
+		latencyHist: make([]int, buckets),
+	}
+}
+
+func percentile(hist []int, samples int, percentile int) time.Duration {
+	if samples == 0 || len(hist) == 0 {
 		return 0
 	}
 
-	idx := int(float64(len(sorted)) * p)
-	if idx >= len(sorted) {
-		idx = len(sorted) - 1
+	rank := (samples*percentile + 99) / 100
+	seen := 0
+	for bucket, count := range hist {
+		seen += count
+		if seen >= rank {
+			return time.Duration(bucket) * time.Millisecond
+		}
 	}
-	return sorted[idx]
+
+	return time.Duration(len(hist)-1) * time.Millisecond
 }
 
 type TrafficGenerator struct {
@@ -109,19 +137,31 @@ type TrafficGenerator struct {
 }
 
 func NewTrafficGenerator(cfg *Config) *TrafficGenerator {
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = 5
+	}
+	if cfg.Concurrency <= 0 {
+		cfg.Concurrency = cfg.RPS
+	}
+
+	timeout := time.Duration(cfg.Timeout) * time.Second
+	idleConns := cfg.Concurrency
+	if idleConns < 1 {
+		idleConns = 1
+	}
+
 	return &TrafficGenerator{
 		config: cfg,
 		client: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: timeout,
 			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 100,
+				MaxIdleConns:        idleConns,
+				MaxIdleConnsPerHost: idleConns,
+				MaxConnsPerHost:     cfg.Concurrency,
 				IdleConnTimeout:     90 * time.Second,
 			},
 		},
-		stats: &Stats{
-			latencies: make([]time.Duration, 0, cfg.RPS*cfg.Duration),
-		},
+		stats: NewStats(timeout),
 	}
 }
 
@@ -184,21 +224,32 @@ func (tg *TrafficGenerator) Run() Summary {
 	defer ticker.Stop()
 
 	timeout := time.After(duration)
-	var wg sync.WaitGroup
+	jobs := make(chan struct{})
+	var workers sync.WaitGroup
+	for i := 0; i < tg.config.Concurrency; i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for range jobs {
+				tg.makeRequest()
+			}
+		}()
+	}
 
-	fmt.Printf("Starting traffic generation: %d rps for %d seconds to %s\n",
-		tg.config.RPS, tg.config.Duration, tg.config.URL)
+	fmt.Printf("Starting traffic generation: %d rps for %d seconds to %s (timeout=%ds, concurrency=%d)\n",
+		tg.config.RPS, tg.config.Duration, tg.config.URL, tg.config.Timeout, tg.config.Concurrency)
 
 	for {
 		select {
 		case <-ticker.C:
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				tg.makeRequest()
-			}()
+			select {
+			case jobs <- struct{}{}:
+			default:
+				tg.stats.recordDropped()
+			}
 		case <-timeout:
-			wg.Wait()
+			close(jobs)
+			workers.Wait()
 			return tg.stats.calculate()
 		}
 	}
@@ -211,6 +262,8 @@ func parseConfig() *Config {
 	flag.StringVar(&cfg.Method, "method", "GET", "HTTP method (GET or POST)")
 	flag.IntVar(&cfg.RPS, "rps", 400, "Requests per second")
 	flag.IntVar(&cfg.Duration, "duration", 10, "Duration in seconds")
+	flag.IntVar(&cfg.Timeout, "timeout", 5, "Request timeout in seconds")
+	flag.IntVar(&cfg.Concurrency, "concurrency", 0, "Max concurrent in-flight requests (default: rps)")
 	flag.StringVar(&cfg.Body, "body", "", "Request body for POST")
 	flag.StringVar(&cfg.Headers, "headers", "", "Headers (comma-separated, e.g. 'Content-Type:application/json,X-Custom:value')")
 
@@ -228,6 +281,26 @@ func parseConfig() *Config {
 		fmt.Println("Error: rps and duration must be positive")
 		flag.Usage()
 		return nil
+	}
+	if time.Second/time.Duration(cfg.RPS) <= 0 {
+		fmt.Println("Error: rps is too high")
+		flag.Usage()
+		return nil
+	}
+
+	if cfg.Timeout <= 0 {
+		fmt.Println("Error: timeout must be positive")
+		flag.Usage()
+		return nil
+	}
+
+	if cfg.Concurrency < 0 {
+		fmt.Println("Error: concurrency cannot be negative")
+		flag.Usage()
+		return nil
+	}
+	if cfg.Concurrency == 0 {
+		cfg.Concurrency = cfg.RPS
 	}
 
 	return cfg
@@ -247,11 +320,13 @@ func main() {
 	fmt.Println("========================================")
 
 	fmt.Printf("  Requests       : %d\n", summary.Requests)
+	fmt.Printf("  Successes      : %d\n", summary.Successes)
 	fmt.Printf("  Errors         : %d\n", summary.Errors)
+	fmt.Printf("  Dropped        : %d\n", summary.Dropped)
 
-	if summary.Requests > summary.Errors {
+	if summary.Successes > 0 {
 		fmt.Println()
-		fmt.Println("  Latency")
+		fmt.Println("  Successful Response Latency")
 		fmt.Println("  ------------------------------")
 		fmt.Printf("  Avg            : %v\n", summary.Avg.Round(time.Millisecond))
 		fmt.Printf("  Min            : %v\n", summary.Min.Round(time.Millisecond))
